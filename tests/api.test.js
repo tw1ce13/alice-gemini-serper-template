@@ -215,6 +215,29 @@ test("GET health check returns an ok response", async () => {
   assert.equal(payload.service, "alice-gemini-serper");
 });
 
+test("GET health check reports the build and the state limits it enforces", async () => {
+  const { payload } = await callHandler({ method: "GET" });
+  // Absence of this block is how you tell a deployment predates the 1 KB fix.
+  assert.equal(payload.stateHandling.byteLimit, STATE_BYTE_LIMIT);
+  assert.ok(payload.stateHandling.byteBudget < STATE_BYTE_LIMIT);
+  assert.deepEqual(payload.stateHandling.cuts, ["session_state", "application_state", "user_state_update"]);
+  assert.ok(payload.build, "build info is missing");
+  assert.equal(typeof payload.keys.gemini, "boolean");
+});
+
+test("an unexpected failure returns a valid Alice response instead of HTTP 500", async () => {
+  const body = { request: { command: "привет" }, session: { new: true } };
+  // Yandex reports any 500 as a bare server error, so nothing may escape.
+  Object.defineProperty(body, "state", { get() { throw new Error("boom in state"); } });
+
+  const { statusCode, payload } = await callHandler({ method: "POST", body });
+  assert.equal(statusCode, 200);
+  assert.equal(payload.version, "1.0");
+  assert.equal(payload.response.end_session, false);
+  assert.ok(payload.response.text.length > 0);
+  assert.ok(byteLength(payload.session_state) <= STATE_BYTE_LIMIT);
+});
+
 test("launch request returns a valid Alice greeting without external API keys", async () => {
   const { statusCode, payload } = await callHandler({
     method: "POST",
