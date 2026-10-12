@@ -445,21 +445,55 @@ function errorForUser(error) {
   }
 }
 
-export default async function handler(req, res) {
-  if (req.method === "GET") {
-    return res.status(200).json({
-      ok: true,
-      service: "alice-gemini-serper",
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
-    });
-  }
+// Opening the webhook URL in a browser answers the question "which code is
+// actually live?", which is otherwise guesswork: a fix that sits on an unmerged
+// branch never reaches the Vercel production deployment.
+function healthReport() {
+  return {
+    ok: true,
+    service: "alice-gemini-serper",
+    message: "Webhook is ready. Yandex Dialogs should send POST requests to /api.",
+    build: {
+      commit: (process.env.VERCEL_GIT_COMMIT_SHA || "unknown").slice(0, 7),
+      branch: process.env.VERCEL_GIT_COMMIT_REF || "unknown",
+      deployedAt: process.env.VERCEL_DEPLOYMENT_ID ? undefined : "local"
+    },
+    // If stateHandling is missing from this output, the deployment predates the
+    // 1 KB state fix and Yandex will reject responses once storage is enabled.
+    stateHandling: {
+      byteBudget: STATE_BYTE_BUDGET,
+      byteLimit: STATE_BYTE_LIMIT,
+      cuts: ["session_state", "application_state", "user_state_update"]
+    },
+    keys: {
+      gemini: Boolean(process.env.GEMINI_API_KEY),
+      serper: Boolean(process.env.SERPER_API_KEY),
+      model: String(process.env.GEMINI_MODEL || DEFAULT_MODEL)
+    }
+  };
+}
 
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+// Every state object that goes back to Yandex is logged with its byte size, so
+// the Vercel runtime log shows directly whether the 1 KB limit was the problem.
+function logStateSizes(payload, startedAt) {
+  const sizes = ["session_state", "application_state", "user_state_update"]
+    .filter(key => payload[key] !== undefined)
+    .map(key => `${key}=${byteLength(payload[key])}b`);
+  const overLimit = ["session_state", "application_state", "user_state_update"]
+    .filter(key => payload[key] !== undefined && byteLength(payload[key]) > STATE_BYTE_LIMIT);
 
-  const startedAt = Date.now();
+  console.log(`[alice] ${Date.now() - startedAt}ms ${sizes.join(" ") || "no state"}`);
+  if (overLimit.length) {
+    console.error(`[alice] STATE OVER ${STATE_BYTE_LIMIT} B: ${overLimit.join(", ")} — Yandex will reject this response`);
+  }
+}
+
+async function respond(req, res, startedAt) {
+  const reply = payload => {
+    logStateSizes(payload, startedAt);
+    return res.status(200).json(payload);
+  };
+
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
@@ -471,14 +505,14 @@ export default async function handler(req, res) {
   const authorized = Boolean(body?.session?.user?.user_id);
 
   if (!text) {
-    return res.status(200).json(aliceResponse(greetingFor(memory), false, oldHistory, {
+    return reply(aliceResponse(greetingFor(memory), false, oldHistory, {
       memory: updateMemory(memory, { text: "", isNewSession }),
       authorized
     }));
   }
 
   if (isForgetIntent(text)) {
-    return res.status(200).json(aliceResponse(
+    return reply(aliceResponse(
       "Хорошо, я всё забыла. Начнём с чистого листа — о чём поговорим?",
       false,
       [],
@@ -488,7 +522,7 @@ export default async function handler(req, res) {
 
   if (isExitIntent(text)) {
     const farewell = memory.name ? `До встречи, ${memory.name}!` : "До встречи!";
-    return res.status(200).json(aliceResponse(farewell, true, [], {
+    return reply(aliceResponse(farewell, true, [], {
       memory: updateMemory(memory, { text: "", isNewSession }),
       authorized
     }));
@@ -517,14 +551,44 @@ export default async function handler(req, res) {
       { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
     ].slice(-MAX_HISTORY_MESSAGES);
 
-    return res.status(200).json(aliceResponse(answer, false, history, { memory: nextMemory, authorized }));
+    return reply(aliceResponse(answer, false, history, { memory: nextMemory, authorized }));
   } catch (error) {
     const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory, {
+    return reply(aliceResponse(errorForUser(safeError), false, oldHistory, {
       memory: nextMemory,
       authorized
     }));
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method === "GET") {
+    return res.status(200).json(healthReport());
+  }
+
+  if (req.method !== "POST") {
+    res.setHeader("Allow", "GET, POST");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const startedAt = Date.now();
+  try {
+    return await respond(req, res, startedAt);
+  } catch (error) {
+    // Anything that escapes respond() would otherwise become an HTTP 500, which
+    // Yandex Dialogs shows as a bare server error with no clue what broke. The
+    // state readers only receive data once storage is enabled, so this path is
+    // exactly where an "it only breaks with storage on" bug would surface.
+    console.error("[alice] unhandled error, returning a safe response:", error?.stack || error);
+    return res.status(200).json({
+      version: "1.0",
+      response: {
+        text: "Внутренняя ошибка навыка. Посмотрите логи Vercel — там есть подробности.",
+        end_session: false
+      },
+      session_state: { h: [] }
+    });
   }
 }
 
